@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Спиннер — крути по-настоящему</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    width: 100%; height: 100%; overflow: hidden;
+    background: radial-gradient(circle at 50% 35%, #2a3a52 0%, #131b29 55%, #080b12 100%);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    touch-action: none; user-select: none; -webkit-user-select: none;
+  }
+  #stage { position: fixed; inset: 0; }
+  canvas { display: block; width: 100%; height: 100%; cursor: grab; }
+  canvas.grabbing { cursor: grabbing; }
+
+  #exit {
+    position: fixed; top: 16px; right: 16px; z-index: 20;
+    width: 54px; height: 54px; border: none; border-radius: 50%;
+    background: linear-gradient(145deg, #ff5e62, #d61f33);
+    color: #fff; font-size: 26px; font-weight: 700; line-height: 1;
+    cursor: pointer; box-shadow: 0 6px 18px rgba(214,31,51,.45), inset 0 1px 2px rgba(255,255,255,.4);
+    display: flex; align-items: center; justify-content: center;
+    transition: transform .12s ease, box-shadow .12s ease;
+  }
+  #exit:hover { transform: scale(1.08); }
+  #exit:active { transform: scale(.92); }
+  #exit::before { content: "✕"; }
+
+  #hud {
+    position: fixed; top: 18px; left: 50%; transform: translateX(-50%);
+    z-index: 15; text-align: center; color: #cfe0ff; pointer-events: none;
+    text-shadow: 0 2px 6px rgba(0,0,0,.6);
+  }
+  #rpm { font-size: 30px; font-weight: 800; letter-spacing: .5px; }
+  #rpm small { font-size: 13px; font-weight: 600; opacity: .65; }
+  #hint {
+    position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%);
+    z-index: 15; color: #9fb3d4; font-size: 14px; text-align: center;
+    background: rgba(10,16,28,.45); padding: 9px 16px; border-radius: 20px;
+    backdrop-filter: blur(4px); pointer-events: none; max-width: 90vw;
+    transition: opacity .6s ease;
+  }
+</style>
+</head>
+<body>
+  <div id="stage"><canvas id="c"></canvas></div>
+  <button id="exit" aria-label="Выход" title="Выход"></button>
+  <div id="hud"><div id="rpm">0 <small>об/мин</small></div></div>
+  <div id="hint">Схвати лепесток и резко крутни влево или вправо · отпусти — крутится по инерции</div>
+
+<script>
+(() => {
+  "use strict";
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const rpmEl = document.getElementById("rpm");
+  const hintEl = document.getElementById("hint");
+
+  // ---- размеры / DPR ----
+  let W = 0, H = 0, cx = 0, cy = 0, R = 0, DPR = 1;
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    cx = W / 2; cy = H / 2;
+    R = Math.min(W, H) * 0.34;           // радиус спиннера (до центров лепестков)
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  // ---- физика ----
+  const ARMS = 3;                         // 3 лепестка
+  let angle = 0;                          // текущий угол, рад
+  let omega = 0;                          // угловая скорость, рад/с
+  const MAX_OMEGA = 9 * 2 * Math.PI;      // ограничение скорости ~9 об/с (реалистичный предел резкого флика)
+  // Затухание: подшипник крутится долго -> очень малое трение.
+  const AIR = 0.30;                       // коэф. вязкого (аэродинамич.) трения, ~ пропорц. omega
+  const BEARING = 0.045;                  // сухое трение подшипника (постоянный тормозящий момент), рад/с^2
+
+  // ---- управление ----
+  let dragging = false;
+  let grabOffset = 0;        // angle = pointerAngle - grabOffset
+  let grabRadiusFactor = 1;  // 0..1 — насколько далеко от центра схвачено (рычаг)
+  // история для вычисления скорости броска
+  let samples = [];          // {t, a}
+
+  function pointerPos(e) {
+    const r = canvas.getBoundingClientRect();
+    const p = (e.touches && e.touches[0]) ? e.touches[0] : e;
+    return { x: p.clientX - r.left, y: p.clientY - r.top };
+  }
+  function angleOf(x, y) { return Math.atan2(y - cy, x - cx); }
+  function distOf(x, y) { const dx = x - cx, dy = y - cy; return Math.sqrt(dx*dx + dy*dy); }
+
+  // нормализация разницы углов в (-PI, PI]
+  function angDiff(a, b) {
+    let d = a - b;
+    while (d > Math.PI) d -= 2 * Math.PI;
+    while (d < -Math.PI) d += 2 * Math.PI;
+    return d;
+  }
+
+  function onDown(e) {
+    const { x, y } = pointerPos(e);
+    const d = distOf(x, y);
+    // хватать можно в пределах диска спиннера
+    if (d > R * 1.55) return;
+    e.preventDefault();
+    dragging = true;
+    canvas.classList.add("grabbing");
+    grabOffset = angDiff(angleOf(x, y), angle); // запоминаем смещение, чтобы лепесток "прилип" к пальцу
+    // рычаг: чем дальше от центра схвачено, тем сильнее раскрутка при том же движении пальца
+    grabRadiusFactor = Math.max(0.18, Math.min(1, d / (R * 1.25)));
+    omega = 0; // при захвате гасим инерцию — спиннер слушается руки
+    samples = [{ t: performance.now(), a: angle }];
+    fadeHint();
+  }
+
+  function onMove(e) {
+    if (!dragging) return;
+    e.preventDefault();
+    const { x, y } = pointerPos(e);
+    const pa = angleOf(x, y);
+    let newAngle = pa - grabOffset;
+    // двигаем плавно по кратчайшему пути
+    angle += angDiff(newAngle, angle);
+    const now = performance.now();
+    samples.push({ t: now, a: angle });
+    // держим окно ~90 мс для оценки скорости рывка
+    while (samples.length > 2 && now - samples[0].t > 90) samples.shift();
+  }
+
+  function onUp(e) {
+    if (!dragging) return;
+    dragging = false;
+    canvas.classList.remove("grabbing");
+    // оценка угловой скорости в момент отпускания (рывок)
+    let v = 0;
+    if (samples.length >= 2) {
+      const a0 = samples[0], a1 = samples[samples.length - 1];
+      const dt = (a1.t - a0.t) / 1000;
+      if (dt > 0.001) v = (a1.a - a0.a) / dt;
+    }
+    // рычаг усиливает бросок: дальше от центра — резче раскрутка
+    v *= (0.55 + 0.75 * grabRadiusFactor);
+    // ограничение максимальной скорости
+    omega = Math.max(-MAX_OMEGA, Math.min(MAX_OMEGA, v));
+    samples = [];
+  }
+
+  // мышь
+  canvas.addEventListener("mousedown", onDown);
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("mouseup", onUp);
+  // тач
+  canvas.addEventListener("touchstart", onDown, { passive: false });
+  canvas.addEventListener("touchmove", onMove, { passive: false });
+  window.addEventListener("touchend", onUp);
+  window.addEventListener("touchcancel", onUp);
+
+  function fadeHint() {
+    if (hintEl && hintEl.style.opacity !== "0") {
+      hintEl.style.opacity = "0";
+      setTimeout(() => hintEl && hintEl.remove(), 700);
+    }
+  }
+
+  // ---- отрисовка спиннера ----
+  function drawSpinner() {
+    ctx.clearRect(0, 0, W, H);
+
+    // мягкая тень под спиннером
+    ctx.save();
+    ctx.translate(cx, cy + R * 0.10);
+    ctx.scale(1, 0.5);
+    const sh = ctx.createRadialGradient(0, 0, 0, 0, 0, R * 1.7);
+    sh.addColorStop(0, "rgba(0,0,0,.45)");
+    sh.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = sh;
+    ctx.beginPath(); ctx.arc(0, 0, R * 1.7, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(angle);
+
+    const lobeR = R * 0.46;     // радиус подушки-лепестка
+    const hubR  = R * 0.30;     // центральная ступица
+
+    // ---- корпус: соединяем центр и лепестки в одну плавную форму ----
+    ctx.beginPath();
+    for (let i = 0; i < ARMS; i++) {
+      const a = (i / ARMS) * Math.PI * 2;
+      const lx = Math.cos(a) * R, ly = Math.sin(a) * R;
+      ctx.moveTo(lx + lobeR, ly);
+      ctx.arc(lx, ly, lobeR, 0, Math.PI * 2);
+    }
+    ctx.arc(0, 0, hubR, 0, Math.PI * 2);
+    const body = ctx.createLinearGradient(-R, -R, R, R);
+    body.addColorStop(0, "#4aa3ff");
+    body.addColorStop(0.5, "#2f6fd6");
+    body.addColorStop(1, "#1c3f87");
+    ctx.fillStyle = body;
+    ctx.shadowColor = "rgba(0,0,0,.5)";
+    ctx.shadowBlur = 18;
+    ctx.shadowOffsetY = 6;
+    ctx.fill();
+    ctx.shadowColor = "transparent";
+
+    // блик-кант по корпусу
+    ctx.lineWidth = Math.max(2, R * 0.018);
+    ctx.strokeStyle = "rgba(255,255,255,.18)";
+    ctx.stroke();
+
+    // ---- лепестки: подшипники-веса ----
+    for (let i = 0; i < ARMS; i++) {
+      const a = (i / ARMS) * Math.PI * 2;
+      const lx = Math.cos(a) * R, ly = Math.sin(a) * R;
+      drawBearing(lx, ly, lobeR * 0.62, "#d7e6ff", "#9bb6e0");
+    }
+
+    // ---- центральный подшипник ----
+    drawBearing(0, 0, hubR * 0.72, "#eaf2ff", "#aac3e8");
+
+    ctx.restore();
+  }
+
+  // подшипник: внешнее кольцо + внутреннее с бликом
+  function drawBearing(x, y, r, c1, c2) {
+    // внешнее металлическое кольцо
+    let g = ctx.createRadialGradient(x - r*0.3, y - r*0.3, r*0.1, x, y, r);
+    g.addColorStop(0, "#fbfdff");
+    g.addColorStop(0.5, c1);
+    g.addColorStop(1, c2);
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = g; ctx.fill();
+    ctx.lineWidth = Math.max(1.5, r * 0.10);
+    ctx.strokeStyle = "rgba(40,70,120,.55)";
+    ctx.stroke();
+
+    // внутреннее кольцо
+    ctx.beginPath(); ctx.arc(x, y, r * 0.55, 0, Math.PI * 2);
+    let g2 = ctx.createRadialGradient(x, y, r*0.1, x, y, r*0.55);
+    g2.addColorStop(0, "#2b4d80");
+    g2.addColorStop(1, "#16263f");
+    ctx.fillStyle = g2; ctx.fill();
+
+    // центральная ось
+    ctx.beginPath(); ctx.arc(x, y, r * 0.22, 0, Math.PI * 2);
+    ctx.fillStyle = "#0c1626"; ctx.fill();
+
+    // блик
+    ctx.beginPath();
+    ctx.arc(x - r*0.35, y - r*0.35, r*0.18, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,255,255,.7)"; ctx.fill();
+  }
+
+  // ---- цикл ----
+  let last = performance.now();
+  function loop(now) {
+    let dt = (now - last) / 1000;
+    last = now;
+    if (dt > 0.05) dt = 0.05; // защита от скачков (вкладка в фоне)
+
+    if (!dragging) {
+      // вязкое трение (пропорц. скорости) + сухое трение подшипника (постоянное)
+      omega -= omega * AIR * dt;
+      if (Math.abs(omega) > 0) {
+        const drop = BEARING * dt;
+        if (Math.abs(omega) <= drop) omega = 0;
+        else omega -= Math.sign(omega) * drop;
+      }
+      angle += omega * dt;
+    } else {
+      // во время перетаскивания скорость отслеживается по движению пальца
+      if (samples.length >= 2) {
+        const a0 = samples[0], a1 = samples[samples.length - 1];
+        const ddt = (a1.t - a0.t) / 1000;
+        omega = ddt > 0.001 ? (a1.a - a0.a) / ddt : 0;
+      }
+    }
+
+    // HUD: обороты в минуту
+    const rpm = Math.round(Math.abs(omega) / (2 * Math.PI) * 60);
+    rpmEl.firstChild.nodeValue = rpm + " ";
+
+    drawSpinner();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  // ---- кнопка выхода ----
+  document.getElementById("exit").addEventListener("click", () => {
+    window.open("", "_self");
+    window.close();
+    // если окно нельзя закрыть программно — показываем заглушку
+    setTimeout(() => {
+      document.body.innerHTML =
+        '<div style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;' +
+        'color:#cfe0ff;font-family:sans-serif;font-size:20px;text-align:center;padding:24px;">' +
+        'Страница закрыта. Можете закрыть эту вкладку.</div>';
+    }, 200);
+  });
+})();
+</script>
+</body>
+</html>
